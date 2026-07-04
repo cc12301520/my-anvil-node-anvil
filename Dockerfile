@@ -13,17 +13,12 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/truste
 EXPOSE 8545
 
 RUN echo '#!/bin/bash\n\
-# 1. 備份現有狀態（如果存在）\n\
-if [ -f "/anvil_state.json" ]; then\n\
-  cp /anvil_state.json /anvil_state_backup.json\n\
-fi\n\
-\n\
-# 2. 清理舊進程\n\
+# 1. 清理舊進程\n\
 pkill -f anvil\n\
 pkill -f ngrok\n\
 sleep 1\n\
 \n\
-# 3. 多節點動態探活池\n\
+# 2. 多節點動態探活\n\
 NODES=(\n\
   "https://cloudflare-eth.com"\n\
   "https://eth.llamarpc.com"\n\
@@ -41,15 +36,23 @@ if [ -z "$FORK_URL" ]; then\n\
   FORK_URL="https://cloudflare-eth.com"\n\
 fi\n\
 \n\
-# 4. 啟動 Anvil 並開啟狀態持久化（--state 與 --dump-state-on-by）\n\
-# 這會讓 Anvil 在接收到關閉信號或定期將所有錢包餘額、轉賬記錄保存到硬碟中\n\
+# 3. 檢查是否存在歷史狀態存檔（核心修復：防止初次啟動無存檔閃退）\n\
+STATE_PARAM=""\n\
+if [ -f "/anvil_state.json" ]; then\n\
+  echo "💾 檢測到歷史狀態存檔，載入存檔啟動..."\n\
+  STATE_PARAM="--state /anvil_state.json"\n\
+else\n\
+  echo "🆕 未檢測到存檔，初始化乾淨環境啟動..."\n\
+  STATE_PARAM="--state /anvil_state.json"\n\
+fi\n\
+\n\
+# 4. 後台啟動 Anvil\n\
 anvil --fork-url "$FORK_URL" \\\n\
       --chain-id 1 \\\n\
       --host 0.0.0.0 \\\n\
       --port 8545 \\\n\
-      --state /anvil_state.json \\\n\
-      --dump-state-on-by receive-signal &\n\
-sleep 3\n\
+      $STATE_PARAM &\n\
+sleep 5\n\
 \n\
 # 5. 啟動 ngrok\n\
 ngrok config add-authtoken $NGROK_AUTHTOKEN\n\
