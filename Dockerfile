@@ -17,7 +17,6 @@ pkill -f anvil\n\
 pkill -f ngrok\n\
 sleep 1\n\
 \n\
-# 多節點動態探活（只在啟動時抓一次合約快照）\n\
 NODES=(\n\
   "https://cloudflare-eth.com"\n\
   "https://eth.llamarpc.com"\n\
@@ -35,14 +34,25 @@ if [ -z "$FORK_URL" ]; then\n\
   FORK_URL="https://cloudflare-eth.com"\n\
 fi\n\
 \n\
-# 狀態持久化硬碟路徑\n\
+# 🔒 核心邏輯：動態獲取當前主網最新區塊號，將節點強制固定鎖死在此區塊！\n\
+LATEST_BLOCK_HEX=$(curl -s -X POST -H "Content-Type: application/json" --data '"'"'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'"'"' "$FORK_URL" | grep -o '"'"'"result":"[^"'"'"']*"'"'"' | cut -d'"'"':'"'"' -f2 | tr -d '"'"'"'"'"')\n\
+if [ -z "$LATEST_BLOCK_HEX" ]; then\n\
+  FORK_BLOCK_CMD=""\n\
+else\n\
+  FORK_BLOCK_DEC=$(printf "%d" "$LATEST_BLOCK_HEX")\n\
+  FORK_BLOCK_CMD="--fork-block-number $FORK_BLOCK_DEC"\n\
+  echo "🎯 成功抓取並鎖定主網區塊快照: $FORK_BLOCK_DEC"\n\
+fi\n\
+\n\
+# 雲端硬碟自動存檔\n\
 STATE_PARAM="--state /anvil_state.json --state-interval 10"\n\
 \n\
-# 後台啟動 Anvil\n\
-# 核心修正：\n\
-# --block-time 1：每秒自動打包，徹底解決轉帳卡死\n\
-# --no-storage-caching：關閉區塊數據動態刷新，防止主網數據沖刷掉轉帳餘額\n\
+# 🚀 終極運行參數：\n\
+# $FORK_BLOCK_CMD -> 只讀取這一次的真實主網額度，後面時間永遠定格。\n\
+# --no-storage-caching -> 徹底關閉後續內存緩存同步，主網新區塊數據再也無法進來沖刷！\n\
+# --block-time 1 -> 本地每秒自動打包虛塊，確保節點內轉帳、流通秒到帳不卡死。\n\
 anvil --fork-url "$FORK_URL" \\\n\
+      $FORK_BLOCK_CMD \\\n\
       --chain-id 1 \\\n\
       --host 0.0.0.0 \\\n\
       --port 8545 \\\n\
