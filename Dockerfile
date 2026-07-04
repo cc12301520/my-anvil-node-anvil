@@ -13,12 +13,11 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/truste
 EXPOSE 8545
 
 RUN echo '#!/bin/bash\n\
-# 1. 清理舊進程\n\
 pkill -f anvil\n\
 pkill -f ngrok\n\
 sleep 1\n\
 \n\
-# 2. 多節點動態探活\n\
+# 多節點動態探活（只在啟動時抓一次合約快照）\n\
 NODES=(\n\
   "https://cloudflare-eth.com"\n\
   "https://eth.llamarpc.com"\n\
@@ -36,24 +35,22 @@ if [ -z "$FORK_URL" ]; then\n\
   FORK_URL="https://cloudflare-eth.com"\n\
 fi\n\
 \n\
-# 3. 狀態持久化參數配置\n\
-STATE_PARAM=""\n\
-if [ -f "/anvil_state.json" ]; then\n\
-  STATE_PARAM="--state /anvil_state.json"\n\
-else\n\
-  STATE_PARAM="--state /anvil_state.json"\n\
-fi\n\
+# 狀態持久化硬碟路徑\n\
+STATE_PARAM="--state /anvil_state.json --state-interval 10"\n\
 \n\
-# 4. 後台啟動 Anvil（核心優化：加入 --block-time 1 開啟自動 1 秒秒打包，徹底解決轉賬卡死）\n\
+# 後台啟動 Anvil\n\
+# 核心修正：\n\
+# --block-time 1：每秒自動打包，徹底解決轉帳卡死\n\
+# --no-storage-caching：關閉區塊數據動態刷新，防止主網數據沖刷掉轉帳餘額\n\
 anvil --fork-url "$FORK_URL" \\\n\
       --chain-id 1 \\\n\
       --host 0.0.0.0 \\\n\
       --port 8545 \\\n\
       --block-time 1 \\\n\
+      --no-storage-caching \\\n\
       $STATE_PARAM &\n\
 sleep 5\n\
 \n\
-# 5. 啟動 ngrok\n\
 ngrok config add-authtoken $NGROK_AUTHTOKEN\n\
 if [ -z "$NGROK_DOMAIN" ]; then\n\
   ngrok http 8545\n\
