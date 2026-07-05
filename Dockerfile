@@ -13,10 +13,12 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/truste
 EXPOSE 8545
 
 RUN echo '#!/bin/bash\n\
+# 1. 清理舊進程\n\
 pkill -f anvil\n\
 pkill -f ngrok\n\
 sleep 1\n\
 \n\
+# 2. 多節點動態探活\n\
 NODES=(\n\
   "https://cloudflare-eth.com"\n\
   "https://eth.llamarpc.com"\n\
@@ -34,33 +36,24 @@ if [ -z "$FORK_URL" ]; then\n\
   FORK_URL="https://cloudflare-eth.com"\n\
 fi\n\
 \n\
-# 🔒 核心邏輯：動態獲取當前主網最新區塊號，將節點強制固定鎖死在此區塊！\n\
-LATEST_BLOCK_HEX=$(curl -s -X POST -H "Content-Type: application/json" --data '"'"'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'"'"' "$FORK_URL" | grep -o '"'"'"result":"[^"'"'"']*"'"'"' | cut -d'"'"':'"'"' -f2 | tr -d '"'"'"'"'"')\n\
-if [ -z "$LATEST_BLOCK_HEX" ]; then\n\
-  FORK_BLOCK_CMD=""\n\
+# 3. 狀態持久化參數配置\n\
+STATE_PARAM=""\n\
+if [ -f "/anvil_state.json" ]; then\n\
+  STATE_PARAM="--state /anvil_state.json"\n\
 else\n\
-  FORK_BLOCK_DEC=$(printf "%d" "$LATEST_BLOCK_HEX")\n\
-  FORK_BLOCK_CMD="--fork-block-number $FORK_BLOCK_DEC"\n\
-  echo "🎯 成功抓取並鎖定主網區塊快照: $FORK_BLOCK_DEC"\n\
+  STATE_PARAM="--state /anvil_state.json"\n\
 fi\n\
 \n\
-# 雲端硬碟自動存檔\n\
-STATE_PARAM="--state /anvil_state.json --state-interval 10"\n\
-\n\
-# 🚀 終極運行參數：\n\
-# $FORK_BLOCK_CMD -> 只讀取這一次的真實主網額度，後面時間永遠定格。\n\
-# --no-storage-caching -> 徹底關閉後續內存緩存同步，主網新區塊數據再也無法進來沖刷！\n\
-# --block-time 1 -> 本地每秒自動打包虛塊，確保節點內轉帳、流通秒到帳不卡死。\n\
+# 4. 後台啟動 Anvil（核心優化：加入 --block-time 1 開啟自動 1 秒秒打包，徹底解決轉賬卡死）\n\
 anvil --fork-url "$FORK_URL" \\\n\
-      $FORK_BLOCK_CMD \\\n\
       --chain-id 1 \\\n\
       --host 0.0.0.0 \\\n\
       --port 8545 \\\n\
       --block-time 1 \\\n\
-      --no-storage-caching \\\n\
       $STATE_PARAM &\n\
 sleep 5\n\
 \n\
+# 5. 啟動 ngrok\n\
 ngrok config add-authtoken $NGROK_AUTHTOKEN\n\
 if [ -z "$NGROK_DOMAIN" ]; then\n\
   ngrok http 8545\n\
