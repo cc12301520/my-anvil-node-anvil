@@ -11,6 +11,7 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/truste
     && apt-get update && apt-get install -y ngrok
 
 EXPOSE 8545
+EXPOSE 3000
 
 RUN echo '#!/bin/bash\n\
 # 1. 清理舊進程\n\
