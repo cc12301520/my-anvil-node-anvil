@@ -24,6 +24,7 @@ sleep 1\n\
 \n\
 # 2. 多節點動態探活（完全保留 5 版 Baseline）\n\
 NODES=(\n\
+  "https://rpc.ankr.com/eth"\n\
   "https://cloudflare-eth.com"\n\
   "https://eth.llamarpc.com"\n\
 )\n\
