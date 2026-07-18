@@ -17,32 +17,30 @@ pkill -f ngrok\n\
 pkill -f nc\n\
 sleep 1\n\
 \n\
-# ---------- 模塊一：RPC Pool ----------
-RPC_POOL=(
-  # ===== 第一梯隊（高優先級）=====
-  "https://ethereum-rpc.publicnode.com"
-  "https://ethereum.publicnode.com"
-  "https://rpc.flashbots.net"
-  "https://rpc.payload.de"
-  "https://ethereum.drpc.org"
-  "https://rpc.ankr.com/eth"
-  "https://eth-mainnet.g.alchemy.com/v2/demo"
-
-  # ===== 第二梯隊（備援）=====
-  "https://1rpc.io/eth"
-  "https://eth.meowrpc.com"
-  "https://rpc.gateway.fm/v1/ethereum/mainnet"
-  "https://eth.llamarpc.com"
-  "https://eth-mainnet.public.blastapi.io"
-  "https://cloudflare-eth.com"
-  "https://ethereum.blockpi.network/v1/rpc/public"
-  "https://mainnet.gateway.tenderly.co"
-)
-
-# 啟動時隨機打亂
-RPC_POOL=($(for r in "${RPC_POOL[@]}"; do
-    echo "$RANDOM $r"
-done | sort -n | cut -d" " -f2-))
+# ---------- 模塊一：RPC Pool ----------\n\
+RPC_POOL=(\n\
+  # ===== 第一梯隊 =====\n\
+  "https://ethereum-rpc.publicnode.com"\n\
+  "https://ethereum.publicnode.com"\n\
+  "https://rpc.flashbots.net"\n\
+  "https://rpc.payload.de"\n\
+  "https://ethereum.drpc.org"\n\
+  "https://rpc.ankr.com/eth"\n\
+  "https://ethereum.blockpi.network/v1/rpc/public"\n\
+  "https://rpc.builder0x69.io"\n\
+\n\
+  # ===== 第二梯隊 =====\n\
+  "https://1rpc.io/eth"\n\
+  "https://eth.meowrpc.com"\n\
+  "https://rpc.gateway.fm/v1/ethereum/mainnet"\n\
+  "https://eth-mainnet.public.blastapi.io"\n\
+  "https://mainnet.gateway.tenderly.co"\n\
+  "https://eth.llamarpc.com"\n\
+  "https://cloudflare-eth.com"\n\
+)\n\
+\n\
+RPC_POOL=($(for r in "${RPC_POOL[@]}"; do echo "$RANDOM $r"; done | sort -n | cut -d" " -f2-))\n\
+\n\
 # ---------- 模塊二：RPC 黑名單 ----------\n\
 RPC_BLACKLIST_SECONDS=1800\n\
 is_rpc_blacklisted(){\n\
