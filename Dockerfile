@@ -27,7 +27,6 @@ NODES=(\n\
   "https://cloudflare-eth.com"\n\
   "https://eth.llamarpc.com"\n\
   "https://rpc.ankr.com/eth"\n\
-  "https://ethereum.publicnode.com"\n\
 )\n\
 FORK_URL=""\n\
 for node in "${NODES[@]}"; do\n\
