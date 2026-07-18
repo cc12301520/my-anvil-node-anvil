@@ -21,6 +21,9 @@ sleep 1\n\
 NODES=(\n\
   "https://eth.llamarpc.com"\n\
   "https://rpc.ankr.com/eth"\n\
+  "https://ethereum.drpc.org"\n\
+  "https://eth.drpc.org"\n\
+  "https://eth-mainnet.public.blastapi.io"\n\
 )\n\
 FORK_URL=""\n\
 for node in "${NODES[@]}"; do\n\
