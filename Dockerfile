@@ -138,7 +138,6 @@ start_anvil(){\n\
         --chain-id 1 \\\n\
         --host 0.0.0.0 \\\n\
         --port 8545 \\\n\
-        --block-time 1 \\\n\
         $STATE_PARAM &\n\
   ANVIL_PID=$!\n\
   \n\
@@ -253,7 +252,7 @@ health_loop &\n\
 \n\
 # 🎯 [SRE 最小變更外掛：原生非阻塞健康檢查響應器]\n\
 while true; do \n\
-  echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nConnection: close\\r\\n\\r\\nOK" | nc -l -p 3000 -q 1\n\
+  echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nConnection: close\\r\\n\\r\\nOK" | nc -l -p "${PORT:-3000}" -q 1\n\
 done &\n\
 \n\
 # 5. 啟動 ngrok（修改處四：使用 exec 啟動 ngrok）\n\
