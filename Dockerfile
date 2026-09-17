@@ -34,12 +34,10 @@ RPC_POOL=(\n\
   "https://eth.meowrpc.com"\n\
   "https://rpc.gateway.fm/v1/ethereum/mainnet"\n\
   "https://eth-mainnet.public.blastapi.io"\n\
-  "https://mainnet.gateway.tenderly.co"\n\
   "https://eth.llamarpc.com"\n\
   "https://cloudflare-eth.com"\n\
 )\n\
 \n\
-RPC_POOL=($(for r in "${RPC_POOL[@]}"; do echo "$RANDOM $r"; done | sort -n | cut -d" " -f2-))\n\
 \n\
 # ---------- 模塊二：RPC 黑名單 ----------\n\
 RPC_BLACKLIST_SECONDS=1800\n\
@@ -205,7 +203,7 @@ health_loop(){\n\
     RESPONSE1=$(curl -s --max-time 5 --write-out "\\n%{http_code}" \\\n\
       -X POST \\\n\
       -H "Content-Type: application/json" \\\n\
-      --data '"'"'{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}'"'"' \\\n\
+      --data '"'"'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'"'"' \\\n\
       http://127.0.0.1:8545)\n\
     local ec1=$?\n\
     local hc1=$(echo "$RESPONSE1" | tail -n1)\n\
@@ -219,7 +217,7 @@ health_loop(){\n\
       RESPONSE2=$(curl -s --max-time 5 --write-out "\\n%{http_code}" \\\n\
         -X POST \\\n\
         -H "Content-Type: application/json" \\\n\
-        --data '"'"'{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}'"'"' \\\n\
+        --data '"'"'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'"'"' \\\n\
         http://127.0.0.1:8545)\n\
       local ec2=$?\n\
       local hc2=$(echo "$RESPONSE2" | tail -n1)\n\
@@ -252,7 +250,8 @@ health_loop &\n\
 \n\
 # 🎯 [SRE 最小變更外掛：原生非阻塞健康檢查響應器]\n\
 while true; do \n\
-  echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nConnection: close\\r\\n\\r\\nOK" | nc -l -p "${PORT:-3000}" -q 1\n\
+  if curl -s --max-time 2 -X POST -H "Content-Type: application/json" --data '"'"'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'"'"' http://127.0.0.1:8545 | grep -q '"'"'"result"'"'"'; then status="200 OK"; body="OK"; else status="503 Service Unavailable"; body="Anvil unavailable"; fi\n\
+  printf "HTTP/1.1 %s\\r\\nContent-Type: text/plain\\r\\nConnection: close\\r\\n\\r\\n%s\n" "$status" "$body" | nc -l -p "${PORT:-3000}" -q 1\n\
 done &\n\
 \n\
 # 5. 啟動 ngrok（修改處四：使用 exec 啟動 ngrok）\n\
