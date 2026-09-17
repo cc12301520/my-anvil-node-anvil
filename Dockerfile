@@ -1,4 +1,5 @@
 FROM ubuntu:22.04
+ENV ANVIL_BLOCK_TIME=1
 # 1. 完美還原 5 版 Baseline 環境安裝（僅加入 netcat 作為極輕量非阻塞健康檢查工具）
 RUN apt-get update && apt-get install -y curl git xz-utils sudo netcat-openbsd && rm -rf /var/lib/apt/lists/*
 RUN curl -L https://foundry.paradigm.xyz | bash
@@ -136,6 +137,7 @@ start_anvil(){\n\
         --chain-id 1 \\\n\
         --host 0.0.0.0 \\\n\
         --port 8545 \\\n\
+        --block-time "$ANVIL_BLOCK_TIME" \\\n\
         $STATE_PARAM &\n\
   ANVIL_PID=$!\n\
   \n\
