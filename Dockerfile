@@ -1,10 +1,18 @@
-# syntax=docker/dockerfile:1
 FROM ubuntu:22.04
 
-# 原版基础环境；仅增加 Node.js/npm，用于让余额保护 JS 在 Render 内部独立运行。
+# 原版基础环境；Node.js 在下一步安装受 ethers v6 支持的现代版本。
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates curl git xz-utils sudo netcat-openbsd nodejs npm \
+       ca-certificates curl git xz-utils sudo netcat-openbsd gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 22.04 默认 Node.js 版本过旧，无法解析 ethers v6 的私有方法语法。
+# 固定使用 Node.js 20，并在构建期验证主版本，避免部署后保护器反复退出。
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs \
+    && node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)' \
+    && node --version \
+    && npm --version \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -L https://foundry.paradigm.xyz | bash
@@ -22,7 +30,7 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
 # Render 内只安装一份保护器及其 ethers 依赖。
 RUN mkdir -p /opt/node-monitor/data \
     && npm install --prefix /opt/node-monitor --omit=dev ethers@6
-# 本交付版本位于仓库 outputs 目录；Render Build Context 保持仓库根目录 "."。
+# GitHub 部署时 Dockerfile 与 JS 都放在仓库根目录。
 COPY node-monitor-restored.js /opt/node-monitor/node-monitor-restored.js
 
 EXPOSE 8545
