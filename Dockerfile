@@ -23,7 +23,7 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
 RUN mkdir -p /opt/node-monitor/data \
     && npm install --prefix /opt/node-monitor --omit=dev ethers@6
 # 本交付版本位于仓库 outputs 目录；Render Build Context 保持仓库根目录 "."。
-COPY outputs/node-monitor-restored.js /opt/node-monitor/node-monitor-restored.js
+COPY node-monitor-restored.js /opt/node-monitor/node-monitor-restored.js
 
 EXPOSE 8545
 EXPOSE 3000
