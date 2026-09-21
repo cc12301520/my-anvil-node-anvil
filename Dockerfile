@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM ubuntu:22.04
 
 # 原版基础环境；Node.js 在下一步安装受 ethers v6 支持的现代版本。
@@ -77,6 +78,22 @@ mapfile -t RPC_POOL < <(
 RPC_BLACKLIST_SECONDS=1800
 FORK_URL=""
 ANVIL_PID=""
+NGROK_PID=""
+
+# Render 停止或替换实例时主动关闭 ngrok，尽快释放固定域名。
+shutdown_all() {
+  echo "[Shutdown] Releasing ngrok endpoint and stopping Anvil..."
+  if [ -n "$NGROK_PID" ]; then
+    kill -TERM "$NGROK_PID" 2>/dev/null || true
+    wait "$NGROK_PID" 2>/dev/null || true
+  fi
+  if [ -n "$ANVIL_PID" ]; then
+    kill -TERM "$ANVIL_PID" 2>/dev/null || true
+    wait "$ANVIL_PID" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap shutdown_all SIGTERM SIGINT
 
 is_rpc_blacklisted() {
   local rpc="$1"
@@ -338,14 +355,26 @@ if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
 fi
 
 ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-if [ -z "${NGROK_DOMAIN:-}" ]; then
-  exec ngrok http 8545
-else
-  exec ngrok http --url="https://${NGROK_DOMAIN}" 8545
-fi
+
+# Render 暂停/重启时，旧 ngrok 会话可能在服务器端延迟释放。
+# 不启用 pooling（避免两个不同 Anvil 状态被负载均衡）；只等待旧会话释放后重试。
+while true; do
+  if [ -z "${NGROK_DOMAIN:-}" ]; then
+    ngrok http 8545 &
+  else
+    ngrok http --url="https://${NGROK_DOMAIN}" 8545 &
+  fi
+  NGROK_PID=$!
+  wait "$NGROK_PID"
+  ngrok_exit=$?
+  NGROK_PID=""
+  echo "[Ngrok] Exited with code ${ngrok_exit}; endpoint may still be releasing. Retrying in 15s..."
+  sleep 15
+done
 START_SCRIPT_EOF
 
 chmod +x /start.sh
 DOCKER_BUILD_EOF
 
 CMD ["/start.sh"]
+
