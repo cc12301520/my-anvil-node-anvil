@@ -32,7 +32,7 @@ RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
 RUN mkdir -p /opt/node-monitor/data \
     && npm install --prefix /opt/node-monitor --omit=dev ethers@6
 # GitHub 部署时 Dockerfile 与 JS 都放在仓库根目录。
-COPY node-monitor-restored.js /opt/node-monitor/node-monitor-restored.js
+COPY node-monitor-session.js /opt/node-monitor/node-monitor-session.js
 
 EXPOSE 8545
 EXPOSE 3000
@@ -46,7 +46,7 @@ cat > /start.sh <<'START_SCRIPT_EOF'
 # ---------- 1. 清理旧进程 ----------
 pkill -f anvil 2>/dev/null || true
 pkill -f ngrok 2>/dev/null || true
-pkill -f node-monitor-restored.js 2>/dev/null || true
+pkill -f node-monitor-session.js 2>/dev/null || true
 pkill -f "nc -l" 2>/dev/null || true
 sleep 1
 
@@ -79,18 +79,47 @@ RPC_BLACKLIST_SECONDS=1800
 FORK_URL=""
 ANVIL_PID=""
 NGROK_PID=""
+MONITOR_SUPERVISOR_PID=""
+HEALTH_LOOP_PID=""
+DATA_DIR="/opt/node-monitor/data"
+ANVIL_GENERATION_FILE="${DATA_DIR}/anvil-generation"
+SESSION_READY_FILE="${DATA_DIR}/session-ready"
+MONITOR_PID_FILE="/tmp/node-monitor-session.pid"
+ANVIL_PID_FILE="/tmp/anvil.pid"
+rm -f "$SESSION_READY_FILE"
+
+stop_pid() {
+  local target_pid="$1"
+  [ -z "$target_pid" ] && return
+  kill -TERM "$target_pid" 2>/dev/null || true
+  for attempt in {1..15}; do
+    kill -0 "$target_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$target_pid" 2>/dev/null; then
+    kill -KILL "$target_pid" 2>/dev/null || true
+  fi
+  wait "$target_pid" 2>/dev/null || true
+}
 
 # Render 停止或替换实例时主动关闭 ngrok，尽快释放固定域名。
 shutdown_all() {
-  echo "[Shutdown] Releasing ngrok endpoint and stopping Anvil..."
+  echo "[Shutdown] Releasing ngrok, saving Session, then stopping Anvil..."
+  rm -f "$SESSION_READY_FILE"
+  [ -n "$HEALTH_LOOP_PID" ] && kill -TERM "$HEALTH_LOOP_PID" 2>/dev/null || true
   if [ -n "$NGROK_PID" ]; then
     kill -TERM "$NGROK_PID" 2>/dev/null || true
     wait "$NGROK_PID" 2>/dev/null || true
   fi
-  if [ -n "$ANVIL_PID" ]; then
-    kill -TERM "$ANVIL_PID" 2>/dev/null || true
-    wait "$ANVIL_PID" 2>/dev/null || true
+  if [ -n "$MONITOR_SUPERVISOR_PID" ]; then
+    kill -TERM "$MONITOR_SUPERVISOR_PID" 2>/dev/null || true
+    wait "$MONITOR_SUPERVISOR_PID" 2>/dev/null || true
   fi
+  if [ -f "$ANVIL_PID_FILE" ]; then
+    current_anvil_pid=$(cat "$ANVIL_PID_FILE")
+    stop_pid "$current_anvil_pid"
+  fi
+  rm -f "$SESSION_READY_FILE" "$MONITOR_PID_FILE" "$ANVIL_PID_FILE"
   exit 0
 }
 trap shutdown_all SIGTERM SIGINT
@@ -192,13 +221,19 @@ find_rpc() {
 }
 
 # ---------- 3. Anvil：完整保留原版 chain-id、端口、1秒出块与 state ----------
-STATE_PARAM="--state /anvil_state.json"
+STATE_PARAM="--state /opt/node-monitor/data/anvil-state.json"
 
 start_anvil() {
   if ! find_rpc || [ -z "$FORK_URL" ]; then
     echo "[Error] No RPC Available"
     return 1
   fi
+
+  # 在新RPC开始监听之前发布代际，防止JS先看到新节点、稍后才看到新标记。
+  rm -f "$SESSION_READY_FILE"
+  local generation="$(date +%s%N)-${RANDOM}-${RANDOM}"
+  printf '%s\n' "$generation" > "${ANVIL_GENERATION_FILE}.tmp"
+  mv "${ANVIL_GENERATION_FILE}.tmp" "$ANVIL_GENERATION_FILE"
 
   anvil --fork-url "$FORK_URL" \
         --fork-retry-backoff 3000 \
@@ -208,6 +243,7 @@ start_anvil() {
         --block-time 1 \
         $STATE_PARAM &
   ANVIL_PID=$!
+  echo "$ANVIL_PID" > "$ANVIL_PID_FILE"
 
   sleep 5
   if ! kill -0 "$ANVIL_PID" 2>/dev/null; then
@@ -215,6 +251,8 @@ start_anvil() {
     mark_rpc_bad "$FORK_URL"
     return 1
   fi
+
+  echo "[Anvil] generation=$generation"
   return 0
 }
 
@@ -222,10 +260,12 @@ restart_anvil() {
   echo "[Restart] Current RPC: $FORK_URL"
   echo "[Restart] Saving state and switching upstream RPC..."
 
-  # SIGTERM 让 Anvil 有机会按 --state 写回 /anvil_state.json。
+  # 先关闭就绪状态，避免恢复期间被误认为可用。
+  rm -f "$SESSION_READY_FILE"
+
+  # SIGTERM 让 Anvil 有机会按 --state 写回状态文件。
   if [ -n "$ANVIL_PID" ]; then
-    kill -TERM "$ANVIL_PID" 2>/dev/null || true
-    wait "$ANVIL_PID" 2>/dev/null || true
+    stop_pid "$ANVIL_PID"
   fi
   mark_rpc_bad "$FORK_URL"
 
@@ -256,18 +296,30 @@ done
 # ---------- 4. Render 内部唯一余额保护器 ----------
 # 如果 JS 意外退出，5秒后自动重启；不需要本地电脑或 Terminal 常驻。
 monitor_supervisor() {
+  local monitor_pid=""
+  # supervisor是Node的真正父进程，负责等待其完成Session保存。
+  trap 'stop_pid "$monitor_pid"; rm -f "$MONITOR_PID_FILE" "$SESSION_READY_FILE"; exit 0' TERM INT
   while true; do
-    echo "[Monitor] Starting original-feature balance protector..."
+    echo "[Monitor] Starting Session ledger protector..."
     RPC_URL="http://127.0.0.1:8545" \
-    DATA_DIR="/opt/node-monitor/data" \
+    DATA_DIR="$DATA_DIR" \
+    ANVIL_GENERATION_FILE="$ANVIL_GENERATION_FILE" \
+    SESSION_READY_FILE="$SESSION_READY_FILE" \
     HEALTH_PORT="8546" \
-      node /opt/node-monitor/node-monitor-restored.js
+    PUBLIC_RPC_PORT="8547" \
+      node /opt/node-monitor/node-monitor-session.js &
+    monitor_pid=$!
+    echo "$monitor_pid" > "$MONITOR_PID_FILE"
+    wait "$monitor_pid"
     monitor_exit=$?
+    monitor_pid=""
+    rm -f "$MONITOR_PID_FILE" "$SESSION_READY_FILE"
     echo "[Monitor] Exited with code ${monitor_exit}; restarting after 5s"
     sleep 5
   done
 }
 monitor_supervisor &
+MONITOR_SUPERVISOR_PID=$!
 
 # ---------- 5. Anvil 健康检查与自动切换 ----------
 health_loop() {
@@ -325,12 +377,13 @@ health_loop() {
   done
 }
 health_loop &
+HEALTH_LOOP_PID=$!
 
 # ---------- 6. Render 对外健康端口 ----------
 # 不再永远返回绿灯：Anvil 可响应才返回 200，否则返回 503。
 render_health_server() {
   while true; do
-    if curl -s --max-time 2 \
+    if [ -f "$SESSION_READY_FILE" ] && curl -s --max-time 2 \
       -X POST \
       -H "Content-Type: application/json" \
       --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
@@ -348,6 +401,18 @@ render_health_server() {
 }
 render_health_server &
 
+# 首次启动必须等Session初始化/导入/回灌完成，才允许建立外部ngrok入口。
+ready_wait=0
+while [ ! -f "$SESSION_READY_FILE" ]; do
+  if [ "$ready_wait" -ge 180 ]; then
+    echo "[Fatal] Session protector did not become ready within 180s"
+    exit 1
+  fi
+  sleep 2
+  ready_wait=$((ready_wait + 2))
+done
+echo "[Ready] Session restored; opening ngrok endpoint"
+
 # ---------- 7. ngrok 保持原版固定域名逻辑 ----------
 if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
   echo "[Fatal] NGROK_AUTHTOKEN is not configured"
@@ -360,9 +425,9 @@ ngrok config add-authtoken "$NGROK_AUTHTOKEN"
 # 不启用 pooling（避免两个不同 Anvil 状态被负载均衡）；只等待旧会话释放后重试。
 while true; do
   if [ -z "${NGROK_DOMAIN:-}" ]; then
-    ngrok http 8545 &
+    ngrok http 8547 &
   else
-    ngrok http --url="https://${NGROK_DOMAIN}" 8545 &
+    ngrok http --url="https://${NGROK_DOMAIN}" 8547 &
   fi
   NGROK_PID=$!
   wait "$NGROK_PID"
@@ -377,4 +442,5 @@ chmod +x /start.sh
 DOCKER_BUILD_EOF
 
 CMD ["/start.sh"]
+
 
