@@ -12,6 +12,7 @@ const AUDIT_INTERVAL_MS = 30000;
 const HEALTH_PORT = Number(process.env.HEALTH_PORT || 3000);
 // Render 使用这个轻量入口：账本恢复期间暂停外部RPC，完成后原样转发。
 const PUBLIC_RPC_PORT = Number(process.env.PUBLIC_RPC_PORT || 0);
+const MANAGER_HEALTH_PORT = Number(process.env.MANAGER_HEALTH_PORT || 0);
 
 // true：明确建立全新 Session；正常使用必须保持 false。
 const FORCE_NEW_SESSION = false;
@@ -27,7 +28,9 @@ const FORCE_REFRESH_INITIAL = false;
 const LOG_SESSION_EXPORT_ON_TRANSFER = true;
 
 const networkConfig = new ethers.Network("mainnet", 1);
-const provider = new ethers.JsonRpcProvider(RPC_URL, networkConfig, {
+const rpcRequest = new ethers.FetchRequest(RPC_URL);
+rpcRequest.timeout = 45000;
+const provider = new ethers.JsonRpcProvider(rpcRequest, networkConfig, {
     staticNetwork: true,
     batchMaxCount: 1,
     cacheTimeout: -1
@@ -82,6 +85,9 @@ const ANVIL_GENERATION_FILE = process.env.ANVIL_GENERATION_FILE
     || path.join(DATA_DIR, "anvil-generation");
 const READY_FILE = process.env.SESSION_READY_FILE
     || path.join(DATA_DIR, "session-ready");
+const RESTART_REQUEST_FILE = path.join(DATA_DIR, "anvil-restart-request");
+const WORKER_HEARTBEAT_FILE = path.join(DATA_DIR, "worker-heartbeat");
+const FATAL_FILE = path.join(DATA_DIR, "fatal-error");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const SESSION_VERSION = 2;
@@ -106,6 +112,50 @@ let lastCheckpointSaveAt = 0;
 const mismatchTracker = new Map();
 const publicSockets = new Set();
 let rpcReady = false;
+let lifecyclePhase = "STARTING";
+let completedRestoreWallets = 0;
+let restoreWalletTotal = 0;
+let workerHeartbeatTimer;
+
+class GenerationChangedError extends Error {}
+
+function isTransientRpcError(error) {
+    const description = [error?.code, error?.message, error?.shortMessage,
+        error?.info?.error?.message, error?.error?.message].filter(Boolean).join(" ");
+    if (/invalid[ _]argument|invalid[ _]params|method not found|unsupported[ _]operation/i.test(description)) return false;
+    return /\b(?:429|502|503|504)\b|rate.?limit|too many requests|ECONN|EPIPE|ETIMEDOUT|EHOST|ENET|ENOTFOUND|EAI_AGAIN|timeout|timed out|socket|network|fetch failed|max retries|temporarily unavailable/i.test(description);
+}
+
+function assertGeneration(generation) {
+    if (shuttingDown || generation !== readAnvilGeneration()) {
+        throw new GenerationChangedError("节点已经换代或服务正在停止，使用同一Session重新恢复");
+    }
+}
+
+async function recoveryRpc(action, label, generation) {
+    let failures = 0;
+    while (!shuttingDown) {
+        assertGeneration(generation);
+        try {
+            const result = await action();
+            assertGeneration(generation);
+            return result;
+        } catch (error) {
+            if (error instanceof GenerationChangedError || !isTransientRpcError(error)) throw error;
+            failures += 1;
+            if (failures === 5 && generation && MANAGER_HEALTH_PORT) {
+                fs.writeFileSync(RESTART_REQUEST_FILE, generation, "utf8");
+                console.error("[Recovery] 当前操作连续失败，请唯一Anvil管理器切换上游");
+            }
+            const delayMs = Math.min(2000 * (2 ** Math.min(failures - 1, 4)), 30000);
+            console.error(`[Recovery] ${label} 暂时失败；${delayMs / 1000}秒后从当前操作重试: ${error.message || error}`);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+    }
+    throw new GenerationChangedError("服务正在停止");
+}
+
+const directRpc = (action) => action();
 
 function normalizeAddress(address) {
     return ethers.getAddress(address);
@@ -353,6 +403,7 @@ function setReady(ready) {
 }
 
 async function waitForRpc() {
+    lifecyclePhase = "WAITING_FOR_ANVIL";
     let waitMs = 1000;
     while (!shuttingDown) {
         try {
@@ -366,40 +417,51 @@ async function waitForRpc() {
     }
 }
 
-async function setErc20Balance(tokenAddress, userAddress, amount, slots) {
+async function setErc20Balance(tokenAddress, userAddress, amount, slots, invoke = directRpc) {
     const paddedUser = ethers.zeroPadValue(userAddress, 32);
     const amountHex = ethers.zeroPadValue(ethers.toBeHex(amount), 32);
     for (const slotIndex of slots) {
         const balanceSlot = ethers.zeroPadValue(ethers.toBeHex(slotIndex), 32);
         const slot = ethers.keccak256(ethers.concat([paddedUser, balanceSlot]));
-        await provider.send("anvil_setStorageAt", [tokenAddress, slot, amountHex]);
+        await invoke(() => provider.send("anvil_setStorageAt", [tokenAddress, slot, amountHex]), "代币余额写入");
     }
 }
 
-async function applyWalletToNode(address, balance) {
-    await provider.send("anvil_setBalance", [address, ethers.toQuantity(balance.eth)]);
+async function applyWalletToNode(address, balance, invoke = directRpc) {
+    await invoke(() => provider.send("anvil_setBalance", [address, ethers.toQuantity(balance.eth)]), "ETH余额写入");
     for (const [symbol, config] of Object.entries(TOKENS)) {
-        await setErc20Balance(config.addr, address, balance[symbol], config.slots);
+        await setErc20Balance(config.addr, address, balance[symbol], config.slots, invoke);
     }
 }
 
-async function restoreSessionToNode(reason) {
+async function restoreSessionToNode(reason, generation) {
+    lifecyclePhase = "RESTORING";
+    completedRestoreWallets = 0;
+    restoreWalletTotal = Object.keys(session.wallets).length;
+    const invoke = (action, label) => recoveryRpc(action, label, generation);
     console.log(`[Session] ${reason}：本次账本优先，正在恢复 ${Object.keys(session.wallets).length} 个钱包...`);
     for (const [address, balance] of Object.entries(session.wallets)) {
         // 任一钱包恢复失败，整套账本保持未就绪，稍后重试。
-        await applyWalletToNode(address, balance);
+        await applyWalletToNode(address, balance, invoke);
         session.nonces ||= {};
         if (session.nonces[address] !== undefined) {
-            await provider.send("anvil_setNonce", [address, ethers.toQuantity(session.nonces[address])]);
+            await invoke(() => provider.send("anvil_setNonce", [address, ethers.toQuantity(session.nonces[address])]), "交易序号写入");
         }
-        const nonce = await provider.getTransactionCount(address);
+        const nonce = await invoke(() => provider.getTransactionCount(address), "交易序号核对");
         if (session.nonces[address] !== undefined && nonce !== session.nonces[address]) {
             throw new Error(`钱包 ${address} nonce恢复校验不一致`);
         }
         session.nonces[address] = nonce;
-        if (!balancesEqual(balance, await getWalletBalances(address))) {
+        // 恢复校验逐项读取，减少冷启动时对公共上游的并发压力。
+        const verified = { eth: await invoke(() => provider.getBalance(address), "ETH余额核对") };
+        for (const symbol of Object.keys(TOKENS)) {
+            verified[symbol] = await invoke(() => tokenContracts[symbol].balanceOf.staticCall(address), `${symbol}余额核对`);
+        }
+        if (!balancesEqual(balance, verified)) {
             throw new Error(`钱包 ${address} 恢复校验不一致`);
         }
+        completedRestoreWallets += 1;
+        console.log(`[Recovery] 钱包核对完成 ${completedRestoreWallets}/${restoreWalletTotal}`);
     }
     mismatchTracker.clear();
 }
@@ -430,17 +492,18 @@ async function resetNodeGeneration(reason, generation = readAnvilGeneration()) {
     setReady(false);
     session.restoreRequired = true;
     saveSession();
-    await restoreSessionToNode(reason);
-    const latestBlock = await provider.getBlockNumber();
-    await setCheckpoint(latestBlock);
+    await restoreSessionToNode(reason, generation);
+    const latestBlock = await recoveryRpc(() => provider.getBlockNumber(), "恢复检查点", generation);
+    await recoveryRpc(() => setCheckpoint(latestBlock), "恢复区块核对", generation);
     const currentGeneration = readAnvilGeneration();
     if (generation && currentGeneration && generation !== currentGeneration) {
-        throw new Error("恢复期间Anvil再次换代，保持未就绪并重试");
+        throw new GenerationChangedError("恢复期间Anvil再次换代，保持未就绪并重试");
     }
     session.anvilGeneration = currentGeneration || generation;
     session.restoreRequired = false;
     session.pendingBaseAddresses = [];
     saveSession({ exportToLog: true, reason: "node-reset-recovery" });
+    lifecyclePhase = "READY";
     setReady(true);
 }
 
@@ -789,6 +852,45 @@ function startHealthServer() {
     return server;
 }
 
+function managerHealth(now = Date.now()) {
+    const stale = [];
+    for (const name of ["main-heartbeat", "anvil-heartbeat", "monitor-heartbeat"]) {
+        try {
+            const [seconds, pid] = fs.readFileSync(path.join(DATA_DIR, name), "utf8").trim().split(/\s+/).map(Number);
+            if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(seconds)
+                || now - seconds * 1000 > 90000 || seconds * 1000 > now + 5000) throw new Error("stale");
+            process.kill(pid, 0);
+        } catch (_) { stale.push(name); }
+    }
+    const fatal = fs.existsSync(FATAL_FILE);
+    const alive = !shuttingDown && !fatal && stale.length === 0;
+    const ready = alive && publicRpcReady();
+    return { alive, rpcReady: ready, state: fatal ? "FATAL" : !alive ? "UNHEALTHY" : ready ? "READY" : "RECOVERING",
+        phase: lifecyclePhase, restoredWallets: completedRestoreWallets, totalWallets: restoreWalletTotal,
+        staleManagers: stale };
+}
+
+function startManagerHealthServer() {
+    if (!MANAGER_HEALTH_PORT) return;
+    if ([HEALTH_PORT, PUBLIC_RPC_PORT].includes(MANAGER_HEALTH_PORT)) {
+        throw new Error("Render健康端口不能与内部RPC/健康端口重复");
+    }
+    const server = http.createServer((req, res) => {
+        const status = managerHealth();
+        const success = req.url === "/ready" ? status.rpcReady : status.alive;
+        res.writeHead(success ? 200 : 503, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(status));
+    });
+    server.listen(MANAGER_HEALTH_PORT, "0.0.0.0", () => {
+        console.log(`[Lifecycle] Render端口 ${MANAGER_HEALTH_PORT} /health=存活，/ready=钱包就绪`);
+    });
+}
+
+function writeWorkerHeartbeat() {
+    fs.writeFileSync(`${WORKER_HEARTBEAT_FILE}.tmp`, `${Math.floor(Date.now() / 1000)} ${process.pid}\n`, "utf8");
+    fs.renameSync(`${WORKER_HEARTBEAT_FILE}.tmp`, WORKER_HEARTBEAT_FILE);
+}
+
 function publicRpcReady() {
     return rpcReady && !shuttingDown && !session?.restoreRequired
         && fs.existsSync(READY_FILE)
@@ -854,6 +956,7 @@ function startPublicRpcServer() {
 async function gracefulShutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
+    clearInterval(workerHeartbeatTimer);
     setReady(false);
     console.log(`[Shutdown] 收到 ${signal}，正在保存Session...`);
     try {
@@ -874,7 +977,22 @@ async function run() {
     setReady(false);
     startHealthServer();
     startPublicRpcServer();
-    await initializeSession();
+    startManagerHealthServer();
+    writeWorkerHeartbeat();
+    workerHeartbeatTimer = setInterval(writeWorkerHeartbeat, 10000);
+    while (!shuttingDown) {
+        try {
+            await initializeSession();
+            lifecyclePhase = "READY";
+            break;
+        } catch (error) {
+            if (!(error instanceof GenerationChangedError) && !isTransientRpcError(error)) throw error;
+            setReady(false);
+            lifecyclePhase = "WAITING_FOR_ANVIL";
+            console.error("[Recovery] 节点变化/短暂连接失败，保留Session后重试:", error.message || error);
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+    }
     console.log(`[${new Date().toLocaleTimeString()}] 🚀 小貓Session账本版已启动，守護中...`);
 
     const loop = async () => {
@@ -889,5 +1007,6 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 run().catch((error) => {
     console.error("[Fatal] Session保护器启动失败:", error);
-    process.exit(1);
+    try { fs.writeFileSync(FATAL_FILE, String(error.message || error), "utf8"); } catch (_) {}
+    process.exit(2);
 });
