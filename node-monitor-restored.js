@@ -23,6 +23,7 @@ const provider = new ethers.JsonRpcProvider(RPC_URL, networkConfig, {
 // 保留原版钱包添加方法：需要新增钱包时，继续直接添加到这里。
 const baseAddresses = [
     "0x4d835A51f3F85dfF9D31bd5445C66EfBf0B05DE6",
+    "0x97C9496fd2f535D5e5bfC2C3F8c42C34429e0a07",
     "0x14bE06184c1EA8656e7330D1d15890f4a26D5151",
     "0x158A2cB942E78ff3C356545b7Cd1B8Ca3648B537",
     "0x32531bBd0A65421A8CBc91EC4Ed41f309463DF44",
