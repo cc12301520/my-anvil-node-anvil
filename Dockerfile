@@ -361,6 +361,12 @@ fi
 
 ngrok config add-authtoken "$NGROK_AUTHTOKEN"
 
+# 新实例先读回远程账本并恢复余额，再开放原来的 ngrok→Anvil 直连入口。
+echo "[Ledger] Waiting for remote ledger recovery before opening ngrok..."
+while [ "$(cat /opt/node-monitor/data/ledger-ready 2>/dev/null)" != "${LEDGER_ID:-}" ] || [ -z "${LEDGER_ID:-}" ]; do
+  sleep 2
+done
+
 # Render 暂停/重启时，旧 ngrok 会话可能在服务器端延迟释放。
 # 不启用 pooling（避免两个不同 Anvil 状态被负载均衡）；只等待旧会话释放后重试。
 while true; do
