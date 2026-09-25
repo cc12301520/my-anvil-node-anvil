@@ -1,3 +1,19 @@
+const { ethers } = require("ethers");
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+
+// ─── 🔑 配置區域（保留原版直接修改方式） ───
+// 本地 Terminal 未设置 RPC_URL 时，继续使用原来的 ngrok 地址；
+// Render 容器会自动设置为 http://127.0.0.1:8545。
+const RPC_URL = process.env.RPC_URL || "https://surging-chirpy-disallow.ngrok-free.dev";
+const CHECK_INTERVAL_MS = 3000;
+const HEALTH_PORT = Number(process.env.HEALTH_PORT || 3000);
+
+// 如果修改了下方初始额度，请改为 true 运行一次，刷新后再改回 false。
+const FORCE_REFRESH_INITIAL = false;
+
+// 保留原版静态 Ethereum Mainnet 配置和禁止 RPC 批处理。
 const networkConfig = new ethers.Network("mainnet", 1);
 const provider = new ethers.JsonRpcProvider(RPC_URL, networkConfig, {
     staticNetwork: true,
@@ -32,7 +48,7 @@ const minABI = ["function balanceOf(address) view returns (uint256)"];
 
 // ─── 仅新增记忆层：保留 restored 的单轮循环与直连结构 ───
 const crypto = require("crypto");
-// 独立私有仓库中的单份账本。GitHub 是持久副本；本地文件只作运行时缓存。
+// 同一个源码仓库的 memory-data 目录保存账本；本地文件只作运行时缓存。
 class GitHubLedger {
     constructor() {
         const repository = (process.env.LEDGER_GITHUB_REPO || "").trim();
@@ -40,7 +56,7 @@ class GitHubLedger {
         const branch = (process.env.LEDGER_GITHUB_BRANCH || "main").trim();
         const id = (process.env.LEDGER_ID || "").trim();
         if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
-            throw new Error("请设置 LEDGER_GITHUB_REPO=账户名/独立私有仓库名");
+            throw new Error("请设置 LEDGER_GITHUB_REPO=当前源码仓库的账户名/仓库名");
         }
         if (!token) throw new Error("请在 Render 环境变量设置 LEDGER_GITHUB_TOKEN");
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id)) {
@@ -52,7 +68,7 @@ class GitHubLedger {
         this.branch = branch;
         this.id = id;
         this.sha = null;
-        this.fileUrl = `https://api.github.com/repos/${repository}/contents/ledgers/${id}.json`;
+        this.fileUrl = `https://api.github.com/repos/${repository}/contents/memory-data/${id}.json`;
     }
 
     async request(method, body) {
@@ -450,5 +466,6 @@ async function run() {
 process.on("SIGTERM",()=>gracefulShutdown("SIGTERM"));
 process.on("SIGINT",()=>gracefulShutdown("SIGINT"));
 run().catch(e=>{console.error("[Fatal] 记忆文件/配置错误，拒绝自动清空:",e);process.exit(1);});
+
 
 
