@@ -1,19 +1,3 @@
-const { ethers } = require("ethers");
-const fs = require("fs");
-const path = require("path");
-const http = require("http");
-
-// ─── 🔑 配置區域（保留原版直接修改方式） ───
-// 本地 Terminal 未设置 RPC_URL 时，继续使用原来的 ngrok 地址；
-// Render 容器会自动设置为 http://127.0.0.1:8545。
-const RPC_URL = process.env.RPC_URL || "https://surging-chirpy-disallow.ngrok-free.dev";
-const CHECK_INTERVAL_MS = 3000;
-const HEALTH_PORT = Number(process.env.HEALTH_PORT || 3000);
-
-// 如果修改了下方初始额度，请改为 true 运行一次，刷新后再改回 false。
-const FORCE_REFRESH_INITIAL = false;
-
-// 保留原版静态 Ethereum Mainnet 配置和禁止 RPC 批处理。
 const networkConfig = new ethers.Network("mainnet", 1);
 const provider = new ethers.JsonRpcProvider(RPC_URL, networkConfig, {
     staticNetwork: true,
@@ -48,11 +32,113 @@ const minABI = ["function balanceOf(address) view returns (uint256)"];
 
 // ─── 仅新增记忆层：保留 restored 的单轮循环与直连结构 ───
 const crypto = require("crypto");
+// 独立私有仓库中的单份账本。GitHub 是持久副本；本地文件只作运行时缓存。
+class GitHubLedger {
+    constructor() {
+        const repository = (process.env.LEDGER_GITHUB_REPO || "").trim();
+        const token = (process.env.LEDGER_GITHUB_TOKEN || "").trim();
+        const branch = (process.env.LEDGER_GITHUB_BRANCH || "main").trim();
+        const id = (process.env.LEDGER_ID || "").trim();
+        if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+            throw new Error("请设置 LEDGER_GITHUB_REPO=账户名/独立私有仓库名");
+        }
+        if (!token) throw new Error("请在 Render 环境变量设置 LEDGER_GITHUB_TOKEN");
+        if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id)) {
+            throw new Error("请设置 LEDGER_ID（字母、数字、下划线或连字符，最多64字）");
+        }
+        if (!branch) throw new Error("LEDGER_GITHUB_BRANCH 不能为空");
+        this.repository = repository;
+        this.token = token;
+        this.branch = branch;
+        this.id = id;
+        this.sha = null;
+        this.fileUrl = `https://api.github.com/repos/${repository}/contents/ledgers/${id}.json`;
+    }
+
+    async request(method, body) {
+        const url = method === "GET"
+            ? `${this.fileUrl}?ref=${encodeURIComponent(this.branch)}` : this.fileUrl;
+        let lastError;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const response = await fetch(url, {
+                    method,
+                    headers: {
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": `Bearer ${this.token}`,
+                        "X-GitHub-Api-Version": "2022-11-28",
+                        ...(body ? { "Content-Type": "application/json" } : {})
+                    },
+                    body: body ? JSON.stringify(body) : undefined,
+                    signal: AbortSignal.timeout(12000)
+                });
+                if (method === "GET" && response.status === 404) return null;
+                if (response.ok) return await response.json();
+                const detail = (await response.text()).slice(0, 300);
+                const error = new Error(`GitHub ${method} HTTP ${response.status}: ${detail}`);
+                if (![429, 500, 502, 503, 504].includes(response.status)) throw error;
+                lastError = error;
+            } catch (error) {
+                lastError = error;
+                if (/HTTP (400|401|403|404|409|422)/.test(error.message)) throw error;
+            }
+            if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+        throw lastError;
+    }
+
+    async load() {
+        const file = await this.request("GET");
+        if (!file) return null;
+        if (file.type !== "file" || !file.sha || typeof file.content !== "string") {
+            throw new Error("GitHub 返回的账本不是完整文件，拒绝使用本地初始额度");
+        }
+        const raw = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
+        const ledger = JSON.parse(raw);
+        if (ledger.ledgerId && ledger.ledgerId !== this.id) {
+            throw new Error("远程文件的账本编号与 LEDGER_ID 不一致");
+        }
+        this.sha = file.sha;
+        return ledger;
+    }
+
+    async save(ledger) {
+        if (ledger.ledgerId !== this.id) throw new Error("拒绝把账本写入其他编号");
+        const json = JSON.stringify(ledger);
+        if (Buffer.byteLength(json) > 900000) throw new Error("账本过大，超过 GitHub 文件接口的安全限额");
+        const previousSha = this.sha;
+        try {
+            const result = await this.request("PUT", {
+                message: `ledger ${this.id} revision ${ledger.revision}`,
+                content: Buffer.from(json).toString("base64"),
+                branch: this.branch,
+                ...(previousSha ? { sha: previousSha } : {})
+            });
+            if (!result?.content?.sha) throw new Error("GitHub 未返回新文件版本，账本提交未确认");
+            this.sha = result.content.sha;
+        } catch (error) {
+            // PUT 可能已经成功，只有响应丢失。回读完全相同的内容即可确认这次提交。
+            let actual;
+            try { actual = await this.request("GET"); }
+            catch { throw error; }
+            const actualJson = typeof actual?.content === "string"
+                ? Buffer.from(actual.content.replace(/\s/g, ""), "base64").toString("utf8") : null;
+            if (actual?.sha && actualJson === json) {
+                this.sha = actual.sha;
+            } else if (actual?.sha && actual.sha !== previousSha) {
+                throw new Error("远程账本已被其他实例或手动修改；拒绝用本地旧版本覆盖。请暂停转账并核对仓库最新账本。");
+            } else {
+                throw error;
+            }
+        }
+        console.log(`[Ledger] 已上传 ${this.id} revision=${ledger.revision}`);
+    }
+}
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const MEMORY_FILE = path.join(DATA_DIR, "session-state.json");
 const GENERATION_FILE = path.join(DATA_DIR, "anvil-generation");
-const FORCE_NEW_SESSION = false;
+const READY_FILE = path.join(DATA_DIR, "ledger-ready");
 const MANUAL_SESSION_IMPORT_BASE64 = ""; // 也可使用 Render 的 SESSION_IMPORT_BASE64
 const MAX_BLOCKS_PER_ROUND = 20; // 只补扫未记账区块；积压时分轮处理
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
@@ -62,6 +148,7 @@ const contracts = Object.fromEntries(Object.entries(TOKENS).map(([s,t]) =>
     [s, new ethers.Contract(t.addr, minABI, provider)]));
 let memory, watchInProgress = false, shuttingDown = false;
 let restoreGeneration, restoredWallets = new Set();
+let remoteLedger;
 
 function initialBalances() {
     return {
@@ -100,7 +187,8 @@ function parseMemory(raw) {
     }
     const cursor = raw.lastProcessedBlock;
     if (cursor != null && (!Number.isSafeInteger(cursor) || cursor < 0)) throw new Error("记忆扫描位置无效");
-    return { version:2, sessionId:String(raw.sessionId || crypto.randomUUID()),
+    return { version:2, ledgerId:raw.ledgerId || null,
+        sessionId:String(raw.sessionId || crypto.randomUUID()),
         createdAt:raw.createdAt || new Date().toISOString(), updatedAt:raw.updatedAt,
         revision:Number(raw.revision) || 0, wallets, nonces,
         anvilGeneration:raw.anvilGeneration || null, lastProcessedBlock:cursor ?? null,
@@ -113,10 +201,13 @@ function atomicWrite(file,text) {
     fs.writeFileSync(file+".tmp",text,"utf8");
     fs.renameSync(file+".tmp",file);
 }
-function saveMemory(next, reason) {
+async function saveMemory(next, reason, upload = true) {
     const saved = clone(next);
     saved.updatedAt = new Date().toISOString();
     saved.revision = (memory?.revision || saved.revision || 0) + 1;
+    saved.ledgerId = remoteLedger.id;
+    // 交易变化先上传独立仓库；失败时不推进本地权威账本的扫描位置。
+    if (reason && upload) await remoteLedger.save(saved);
     // 旧的有效账本作为备份；主文件写入成功后才替换内存对象。
     if (memory && fs.existsSync(MEMORY_FILE)) atomicWrite(MEMORY_FILE+".bak",JSON.stringify(memory));
     atomicWrite(MEMORY_FILE,JSON.stringify(saved));
@@ -129,45 +220,46 @@ function saveMemory(next, reason) {
             atomicWrite(path.join(DATA_DIR,"known_wallets.json"),JSON.stringify(
                 Object.keys(memory.wallets).filter(a => !baseAddresses.some(b => b.toLowerCase()===a.toLowerCase()))));
         } catch (e) { console.error("[Memory] 权威文件已保存；辅助导出失败:",e.message); }
-        console.log("[SessionExport] reason="+reason+" revision="+memory.revision+" base64="+encoded);
+        console.log("[SessionExport] reason="+reason+" remote="+(upload ? "saved" : "unchanged")+
+            " revision="+memory.revision+" base64="+encoded);
     }
 }
-function smartInitialize() {
+async function smartInitialize() {
     let raw, source;
-    if (!FORCE_NEW_SESSION && (fs.existsSync(MEMORY_FILE) || fs.existsSync(MEMORY_FILE+".bak"))) {
-        try { raw = parseMemory(JSON.parse(fs.readFileSync(MEMORY_FILE,"utf8"))); source="local"; }
-        catch (e) {
-            raw = parseMemory(JSON.parse(fs.readFileSync(MEMORY_FILE+".bak","utf8")));
-            source="local-backup";
-            console.error("[Memory] 使用上次有效备份，请核对最新转账");
-        }
+    const stored = await remoteLedger.load();
+    if (stored) {
+        raw = parseMemory(stored);
+        source = "github-latest";
     } else {
         const imported = (process.env.SESSION_IMPORT_BASE64 || MANUAL_SESSION_IMPORT_BASE64).trim();
-        if (!FORCE_NEW_SESSION && imported) {
+        if (imported) {
             raw = parseMemory(JSON.parse(Buffer.from(imported,"base64").toString("utf8")));
-            source="manual-import";
+            source="manual-import-new-ledger";
             raw.restoreRequired=true;
-        } else {
+        } else if (process.env.LEDGER_CREATE_NEW === remoteLedger.id) {
             raw={ version:2,sessionId:crypto.randomUUID(),createdAt:new Date().toISOString(),revision:0,
                 wallets:{},nonces:{},lastProcessedBlock:null,lastProcessedBlockHash:null,
                 anvilGeneration:null,restoreRequired:true,pendingBaseAddresses:[] };
-            source="new";
-            // 兼容 restored 已经保存的余额文件；读取失败不悄悄重置初始余额。
-            const legacy=path.join(DATA_DIR,"lastKnownBalances.json");
-            if (!FORCE_NEW_SESSION && fs.existsSync(legacy)) {
-                raw.wallets=JSON.parse(fs.readFileSync(legacy,"utf8"));
-                raw=parseMemory(raw); source="restored-file";
-            }
+            source="explicit-new-ledger";
+        } else {
+            throw new Error("远程账本不存在：请导入原账本，或明确设置 LEDGER_CREATE_NEW=本次LEDGER_ID");
         }
     }
+    if (source === "github-latest" && raw.ledgerId && raw.ledgerId !== remoteLedger.id) {
+        throw new Error("导入账本编号与 LEDGER_ID 不一致，请使用新编号建账或选回原编号");
+    }
+    raw.ledgerId = remoteLedger.id;
+    let addedBaseWallet = false;
     for (const original of baseAddresses) {
         const address=ethers.getAddress(original);
         if (!raw.wallets[address] || FORCE_REFRESH_INITIAL) {
             raw.wallets[address]=initialBalances();
             raw.pendingBaseAddresses=Array.from(new Set([...raw.pendingBaseAddresses,address]));
+            addedBaseWallet = true;
         }
     }
-    saveMemory(parseMemory(raw),source);
+    // 读取已有账本不会再写一次远程记录，以免与仍在运行的旧实例冲突。
+    await saveMemory(parseMemory(raw),source,source !== "github-latest" || addedBaseWallet);
     console.log("[Memory] 来源="+source+"；钱包="+Object.keys(memory.wallets).length+
         "。恢复期间请勿转账，等待 READY。");
 }
@@ -205,8 +297,9 @@ async function blockAt(number,full=false) {
     return block;
 }
 async function restoreMemory(expected) {
+    fs.rmSync(READY_FILE,{force:true});
     if (restoreGeneration !== expected) { restoredWallets.clear(); restoreGeneration=expected; }
-    if (!memory.restoreRequired) saveMemory({...memory,restoreRequired:true});
+    if (!memory.restoreRequired) await saveMemory({...memory,restoreRequired:true});
     for (const [address,balances] of Object.entries(memory.wallets)) {
         if (restoredWallets.has(address)) continue;
         await applyWallet(address,balances,expected,true);
@@ -221,9 +314,11 @@ async function restoreMemory(expected) {
     }
     const number=await headNumber(), block=await blockAt(number);
     sameGeneration(expected);
-    saveMemory({...memory,anvilGeneration:expected,lastProcessedBlock:number,lastProcessedBlockHash:block.hash,
-        restoreRequired:false,pendingBaseAddresses:[]},"restore-complete");
+    await saveMemory({...memory,anvilGeneration:expected,lastProcessedBlock:number,lastProcessedBlockHash:block.hash,
+        restoreRequired:false,pendingBaseAddresses:[]},"restore-complete",false);
     restoredWallets.clear();
+    sameGeneration(expected);
+    fs.writeFileSync(READY_FILE,remoteLedger.id,"utf8");
     console.log("[Memory] READY：本次记忆已恢复，可进行分叉测试转账");
 }
 function walletAddress(address) {
@@ -266,7 +361,7 @@ async function recordBlocks(head,expected) {
     if ((await blockAt(end)).hash !== finalHash) throw new Error("扫描期间区块变化，下一轮重读");
     sameGeneration(expected);
     next.lastProcessedBlock=end; next.lastProcessedBlockHash=finalHash;
-    saveMemory(next,touched.size ? "confirmed-transfer" : undefined);
+    await saveMemory(next,touched.size ? "confirmed-transfer" : undefined);
     return end===head;
 }
 async function initializeAddedWallets(expected) {
@@ -280,7 +375,7 @@ async function initializeAddedWallets(expected) {
         next.wallets[address]=balances;
         next.nonces[address]=nonce;
         next.pendingBaseAddresses=next.pendingBaseAddresses.filter(a=>a!==address);
-        saveMemory(next,"added-base-wallet");
+        await saveMemory(next,"added-base-wallet");
     }
 }
 async function auditMemory(expected) {
@@ -337,13 +432,15 @@ async function gracefulShutdown(signal) {
     if (shuttingDown) return;
     shuttingDown=true;
     console.log("[Shutdown] 收到 "+signal+"，保存本次记忆");
-    try { if (memory) saveMemory(memory,"shutdown"); }
+    try { if (memory) await saveMemory(memory,"shutdown",false); }
     catch (e) { console.error("[Memory] 保存失败:",e.message); }
     process.exit(0);
 }
 async function run() {
+    fs.rmSync(READY_FILE,{force:true});
+    remoteLedger=new GitHubLedger();
     startHealthServer();
-    smartInitialize();
+    await smartInitialize();
     const loop=async()=>{
         await watchAndProtect();
         if (!shuttingDown) setTimeout(loop,CHECK_INTERVAL_MS);
@@ -353,4 +450,5 @@ async function run() {
 process.on("SIGTERM",()=>gracefulShutdown("SIGTERM"));
 process.on("SIGINT",()=>gracefulShutdown("SIGINT"));
 run().catch(e=>{console.error("[Fatal] 记忆文件/配置错误，拒绝自动清空:",e);process.exit(1);});
+
 
