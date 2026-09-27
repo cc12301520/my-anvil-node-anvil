@@ -1,56 +1,41 @@
 # syntax=docker/dockerfile:1
 FROM ubuntu:22.04
 
-# 原版基础环境；Node.js 在下一步安装受 ethers v6 支持的现代版本。
+# restored 的安装环境；只补充 util-linux，供单实例文件锁使用。
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates curl git xz-utils sudo netcat-openbsd gnupg \
+       ca-certificates curl git xz-utils sudo netcat-openbsd gnupg util-linux \
     && rm -rf /var/lib/apt/lists/*
-
-# Ubuntu 22.04 默认 Node.js 版本过旧，无法解析 ethers v6 的私有方法语法。
-# 固定使用 Node.js 20，并在构建期验证主版本，避免部署后保护器反复退出。
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs \
     && node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)' \
-    && node --version \
-    && npm --version \
     && rm -rf /var/lib/apt/lists/*
-
 RUN curl -L https://foundry.paradigm.xyz | bash
 ENV PATH="/root/.foundry/bin:${PATH}"
 RUN foundryup
-
-RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+RUN curl -fsS https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
       | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null \
     && echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
       | tee /etc/apt/sources.list.d/ngrok.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ngrok \
     && rm -rf /var/lib/apt/lists/*
-
-# Render 内只安装一份保护器及其 ethers 依赖。
 RUN mkdir -p /opt/node-monitor/data \
     && npm install --prefix /opt/node-monitor --omit=dev ethers@6
-# GitHub 部署时 Dockerfile 与 JS 都放在仓库根目录。
 COPY node-monitor-restored.js /opt/node-monitor/node-monitor-restored.js
-
-EXPOSE 8545
-EXPOSE 3000
+RUN node --check /opt/node-monitor/node-monitor-restored.js
+EXPOSE 8545 3000
 
 RUN <<'DOCKER_BUILD_EOF'
 cat > /start.sh <<'START_SCRIPT_EOF'
 #!/bin/bash
-
-# 不使用 set -e：单个公共 RPC 或辅助进程失败时，主服务仍可自行切换与恢复。
-
-# ---------- 1. 清理旧进程 ----------
-pkill -f anvil 2>/dev/null || true
-pkill -f ngrok 2>/dev/null || true
-pkill -f node-monitor-restored.js 2>/dev/null || true
-pkill -f "nc -l" 2>/dev/null || true
-sleep 1
-
-# ---------- 2. 原版 RPC Pool ----------
+# 三个原有组件：Anvil、JS、ngrok。没有交易代理，没有账本就绪阻塞 ngrok。
+DATA_DIR=/opt/node-monitor/data
+mkdir -p "$DATA_DIR"
+export DATA_DIR
+export NODE_STATUS_FILE="$DATA_DIR/anvil-status"
+export RPC_URL=http://127.0.0.1:8545
+export HEALTH_PORT="${PORT:-3000}"
 RPC_POOL=(
   "https://ethereum-rpc.publicnode.com"
   "https://ethereum.publicnode.com"
@@ -67,327 +52,191 @@ RPC_POOL=(
   "https://eth.llamarpc.com"
   "https://cloudflare-eth.com"
 )
+mapfile -t RPC_POOL < <(printf '%s\n' "${RPC_POOL[@]}" | shuf)
 
-# 保留原版随机顺序，避免每次启动都集中使用同一个免费 RPC。
-mapfile -t RPC_POOL < <(
-  for rpc in "${RPC_POOL[@]}"; do
-    printf '%s %s\n' "$RANDOM" "$rpc"
-  done | sort -n | cut -d' ' -f2-
-)
-
-RPC_BLACKLIST_SECONDS=1800
-FORK_URL=""
-ANVIL_PID=""
-NGROK_PID=""
-
-# Render 停止或替换实例时主动关闭 ngrok，尽快释放固定域名。
-shutdown_all() {
-  echo "[Shutdown] Releasing ngrok endpoint and stopping Anvil..."
-  if [ -n "$NGROK_PID" ]; then
-    kill -TERM "$NGROK_PID" 2>/dev/null || true
-    wait "$NGROK_PID" 2>/dev/null || true
-  fi
-  if [ -n "$ANVIL_PID" ]; then
-    kill -TERM "$ANVIL_PID" 2>/dev/null || true
-    wait "$ANVIL_PID" 2>/dev/null || true
-  fi
-  exit 0
+status_write() {
+  printf '%s\n' "$1" > "$NODE_STATUS_FILE.tmp"
+  mv "$NODE_STATUS_FILE.tmp" "$NODE_STATUS_FILE"
 }
-trap shutdown_all SIGTERM SIGINT
-
-is_rpc_blacklisted() {
-  local rpc="$1"
-  [ -z "$rpc" ] && return 0
-
-  local safe_hash
-  local cache_file
-  local last
-  local now
-  safe_hash=$(echo -n "$rpc" | md5sum | cut -d' ' -f1)
-  cache_file="/tmp/bad_rpc_${safe_hash}"
-
-  if [ -f "$cache_file" ]; then
-    last=$(cat "$cache_file")
-    now=$(date +%s)
-    if (( now - last < RPC_BLACKLIST_SECONDS )); then
-      return 0
-    fi
-    rm -f "$cache_file"
-  fi
-  return 1
+port_busy() { nc -z -w 1 127.0.0.1 8545 >/dev/null 2>&1; }
+local_block() {
+  local reply
+  reply=$(curl -fsS --max-time 4 -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+    http://127.0.0.1:8545 2>/dev/null) || return 1
+  [[ "$reply" =~ \"result\"[[:space:]]*:[[:space:]]*\"(0x[0-9a-fA-F]+)\" ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
 }
-
-mark_rpc_bad() {
-  local rpc="$1"
-  [ -z "$rpc" ] && return
-
-  local safe_hash
-  safe_hash=$(echo -n "$rpc" | md5sum | cut -d' ' -f1)
-  date +%s > "/tmp/bad_rpc_${safe_hash}"
-}
-
-rpc_failure_reason() {
-  local exit_code="$1"
-  local http_code="$2"
-  if [ "$exit_code" -eq 28 ]; then echo "Timeout"
-  elif [ "$exit_code" -eq 7 ]; then echo "Connection Refused"
-  elif [ "$http_code" = "429" ]; then echo "429"
-  elif [ "$exit_code" -eq 52 ] || [ "$exit_code" -eq 56 ]; then echo "EOF"
-  else echo "Unknown"
-  fi
-}
-
-test_rpc_once() {
-  local rpc="$1"
-  local response
-  local exit_code
-  local http_code
-  local body
-
-  response=$(curl -s --max-time 8 --write-out $'\n%{http_code}' \
-    -X POST \
-    -H "Content-Type: application/json" \
-    --data '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}' \
-    "$rpc")
-  exit_code=$?
-  http_code=$(echo "$response" | tail -n1)
-  body=$(echo "$response" | sed '$d')
-
-  RPC_TEST_EXIT_CODE="$exit_code"
-  RPC_TEST_HTTP_CODE="$http_code"
-  [ "$exit_code" -eq 0 ] \
-    && [ "$http_code" = "200" ] \
-    && echo "$body" | grep -q '"result"'
-}
-
-find_rpc() {
-  FORK_URL=""
-  for node in "${RPC_POOL[@]}"; do
-    [ -z "$node" ] && continue
-    if is_rpc_blacklisted "$node"; then
-      echo "[Skip] $node (blacklisted)"
-      continue
-    fi
-
-    echo "[Testing] $node"
-    if ! test_rpc_once "$node"; then
-      echo "[Failed] $node (Reason: $(rpc_failure_reason "$RPC_TEST_EXIT_CODE" "$RPC_TEST_HTTP_CODE"))"
-      mark_rpc_bad "$node"
-      continue
-    fi
-
-    # 保留原版双重测试，避免选择只能偶尔成功一次的 RPC。
-    sleep 2
-    if ! test_rpc_once "$node"; then
-      echo "[Failed] $node (Second request: $(rpc_failure_reason "$RPC_TEST_EXIT_CODE" "$RPC_TEST_HTTP_CODE"))"
-      mark_rpc_bad "$node"
-      continue
-    fi
-
-    FORK_URL="$node"
-    echo "[Selected] $node"
-    return 0
+# 只回收本监督器启动的子进程；wait 的调用者也是实际父进程。
+stop_child() {
+  local child="$1"
+  [ -n "$child" ] || return 0
+  kill -TERM "$child" 2>/dev/null || true
+  local i
+  for ((i=0;i<30;i++)); do
+    kill -0 "$child" 2>/dev/null || break
+    sleep 1
   done
-  return 1
+  if kill -0 "$child" 2>/dev/null; then
+    echo "[Stop] Child $child did not exit in 30s; forcing exit (local state may not flush)"
+    kill -KILL "$child" 2>/dev/null || true
+  fi
+  wait "$child" 2>/dev/null || true
 }
 
-# ---------- 3. Anvil：完整保留原版 chain-id、端口、1秒出块与 state ----------
-STATE_PARAM="--state /anvil_state.json"
-
-start_anvil() {
-  if ! find_rpc || [ -z "$FORK_URL" ]; then
-    echo "[Error] No RPC Available"
-    return 1
-  fi
-
-  # 仅新增记忆识别标记，不改变原有启动/健康/ngrok流程。
-  mkdir -p /opt/node-monitor/data
-  printf '%s\n' "$(date +%s%N)-$RANDOM-$RANDOM" > /opt/node-monitor/data/anvil-generation.tmp
-  mv /opt/node-monitor/data/anvil-generation.tmp /opt/node-monitor/data/anvil-generation
-
-  anvil --fork-url "$FORK_URL" \
-        --fork-retry-backoff 3000 \
-        --chain-id 1 \
-        --host 0.0.0.0 \
-        --port 8545 \
-        --block-time 1 \
-        $STATE_PARAM &
-  ANVIL_PID=$!
-
-  sleep 5
-  if ! kill -0 "$ANVIL_PID" 2>/dev/null; then
-    echo "[Anvil Failed]"
-    mark_rpc_bad "$FORK_URL"
-    return 1
-  fi
-  return 0
-}
-
-restart_anvil() {
-  echo "[Restart] Current RPC: $FORK_URL"
-  echo "[Restart] Saving state and switching upstream RPC..."
-
-  # SIGTERM 让 Anvil 有机会按 --state 写回 /anvil_state.json。
-  if [ -n "$ANVIL_PID" ]; then
-    kill -TERM "$ANVIL_PID" 2>/dev/null || true
-    wait "$ANVIL_PID" 2>/dev/null || true
-  fi
-  mark_rpc_bad "$FORK_URL"
-
-  sleep 60
-  local loop_retry=30
-  while ! start_anvil; do
-    echo "[Retry after ${loop_retry}s]"
-    sleep "$loop_retry"
-    if [ "$loop_retry" -lt 300 ]; then
-      loop_retry=$((loop_retry * 2))
-      [ "$loop_retry" -gt 300 ] && loop_retry=300
-    fi
-  done
-  echo "[Restart] New RPC: $FORK_URL"
-  echo "[Restart] Anvil restarted successfully"
-}
-
-RETRY=30
-while ! start_anvil; do
-  echo "[Retry after ${RETRY}s]"
-  sleep "$RETRY"
-  if [ "$RETRY" -lt 300 ]; then
-    RETRY=$((RETRY * 2))
-    [ "$RETRY" -gt 300 ] && RETRY=300
-  fi
-done
-
-# ---------- 4. Render 内部唯一余额保护器 ----------
-# 如果 JS 意外退出，5秒后自动重启；不需要本地电脑或 Terminal 常驻。
-monitor_supervisor() {
+anvil_supervisor() {
+  exec 9>"$DATA_DIR/anvil-supervisor.lock"
+  flock -n 9 || { echo '[Fatal] Another Anvil supervisor owns this container'; return 1; }
+  local child="" node http_code block last_block failures stalled deadline token
+  local retry=5 started=0 now
+  declare -A bad_until
+  trap 'status_write stopping; stop_child "$child"; exit 0' TERM INT
+  status_write starting
   while true; do
-    echo "[Monitor] Starting original-feature balance protector..."
-    RPC_URL="http://127.0.0.1:8545" \
-    DATA_DIR="/opt/node-monitor/data" \
-    HEALTH_PORT="8546" \
-      node /opt/node-monitor/node-monitor-restored.js
-    monitor_exit=$?
-    echo "[Monitor] Exited with code ${monitor_exit}; restarting after 5s"
+    # 端口冲突是本地进程问题，不归咎上游，不拉黑正常 RPC。
+    if port_busy; then
+      echo '[Anvil] 8545 is still occupied; not starting a second process'
+      sleep 10
+      continue
+    fi
+    started=0
+    for node in "${RPC_POOL[@]}"; do
+      now=$(date +%s)
+      (( now < ${bad_until[$node]:-0} )) && continue
+      echo "[Testing] $node"
+      # 仍用两次轻量公共 RPC 测试；429 要尊重冷却，不能不断清空黑名单。
+      local probe_ok=1 attempt reply
+      for attempt in 1 2; do
+        reply=$(curl -sS --max-time 8 --write-out $'\n%{http_code}' \
+          -H 'Content-Type: application/json' \
+          --data '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}' \
+          "$node" 2>/dev/null)
+        http_code="${reply##*$'\n'}"
+        if [ "$http_code" != 200 ] || ! [[ "$reply" =~ \"result\"[[:space:]]*:[[:space:]]*\"0x[0-9a-fA-F]+\" ]]; then
+          echo "[RPC] Probe failed HTTP=$http_code: $node"
+          bad_until[$node]=$(( $(date +%s) + 120 ))
+          [ "$http_code" = 429 ] && bad_until[$node]=$(( $(date +%s) + 1800 ))
+          probe_ok=0
+          break
+        fi
+        [ "$attempt" = 1 ] && sleep 2
+      done
+      [ "$probe_ok" = 1 ] || continue
+      if port_busy; then break; fi
+      echo "[Selected] $node"
+      status_write starting
+      # 保留 restored 原启动参数；不加历史裁剪，不改一秒出块。
+      anvil --fork-url "$node" --fork-retry-backoff 3000 \
+        --chain-id 1 --host 0.0.0.0 --port 8545 \
+        --block-time 1 --state /anvil_state.json &
+      child=$!
+      deadline=$(( $(date +%s) + 120 ))
+      while kill -0 "$child" 2>/dev/null && (( $(date +%s) < deadline )); do
+        if block=$(local_block) && kill -0 "$child" 2>/dev/null; then
+          # 只在本次进程真正监听后发布身份。失败启动不会触发 JS 恢复。
+          token="$(date +%s%N)-$child-$RANDOM"
+          status_write "ready $token"
+          echo "[Anvil] RPC_READY pid=$child upstream=$node"
+          started=1
+          retry=5
+          break
+        fi
+        sleep 2
+      done
+      if [ "$started" = 1 ]; then break; fi
+      echo "[Anvil] Startup failed or exceeded 120s: $node"
+      status_write starting
+      stop_child "$child"
+      child=""
+      bad_until[$node]=$(( $(date +%s) + 1800 ))
+    done
+    if [ "$started" != 1 ]; then
+      echo "[RPC] No ready upstream; checking cooldowns again in ${retry}s"
+      sleep "$retry"
+      retry=$((retry * 2))
+      (( retry > 30 )) && retry=30
+      continue
+    fi
+    failures=0
+    stalled=0
+    last_block="$block"
+    # 同一监督器既启动、检查，也停止 Anvil，避免后台子 shell 的旧 PID。
+    while kill -0 "$child" 2>/dev/null; do
+      sleep 15
+      if block=$(local_block); then
+        failures=0
+        if [ "$block" = "$last_block" ]; then stalled=$((stalled+1)); else stalled=0; fi
+        last_block="$block"
+        if (( stalled >= 5 )); then echo '[Health] Block height stalled for 5 checks'; break; fi
+      else
+        sleep 2
+        if block=$(local_block); then failures=0; continue; fi
+        failures=$((failures+1))
+        echo "[Health] Local RPC FAIL $failures/5"
+        (( failures >= 5 )) && break
+      fi
+    done
+    status_write starting
+    echo '[Restart] Stopping owned Anvil process before any replacement'
+    stop_child "$child"
+    child=""
+    bad_until[$node]=$(( $(date +%s) + 120 ))
     sleep 5
   done
 }
-monitor_supervisor &
-
-# ---------- 5. Anvil 健康检查与自动切换 ----------
-health_loop() {
-  local fail_count=0
-  local max_fail=5
-
+monitor_supervisor() {
+  local child=""
+  trap 'stop_child "$child"; exit 0' TERM INT
   while true; do
+    node /opt/node-monitor/node-monitor-restored.js &
+    child=$!
+    wait "$child"
+    echo "[Monitor] Exited with code $?; restarting after 5s"
+    child=""
+    sleep 5
+  done
+}
+ngrok_supervisor() {
+  local child=""
+  trap 'stop_child "$child"; exit 0' TERM INT
+  while true; do
+    if [ -z "${NGROK_DOMAIN:-}" ]; then ngrok http 8545 &
+    else ngrok http --url="https://${NGROK_DOMAIN}" 8545 & fi
+    child=$!
+    wait "$child"
+    echo "[Ngrok] Exited with code $?; retrying in 15s"
+    child=""
     sleep 15
-    local response
-    local exit_code
-    local http_code
-    local body
-    local final_reason="Unknown"
-
-    response=$(curl -s --max-time 5 --write-out $'\n%{http_code}' \
-      -X POST \
-      -H "Content-Type: application/json" \
-      --data '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}' \
-      http://127.0.0.1:8545)
-    exit_code=$?
-    http_code=$(echo "$response" | tail -n1)
-    body=$(echo "$response" | sed '$d')
-
-    if [ "$exit_code" -eq 0 ] && [ "$http_code" = "200" ] && echo "$body" | grep -q '"result"'; then
-      fail_count=0
-      echo "[Health] OK"
-      continue
-    fi
-
-    # 保留原版二次确认，避免一次网络抖动就重启并影响正在处理的交易。
-    sleep 2
-    response=$(curl -s --max-time 5 --write-out $'\n%{http_code}' \
-      -X POST \
-      -H "Content-Type: application/json" \
-      --data '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}' \
-      http://127.0.0.1:8545)
-    exit_code=$?
-    http_code=$(echo "$response" | tail -n1)
-    body=$(echo "$response" | sed '$d')
-
-    if [ "$exit_code" -eq 0 ] && [ "$http_code" = "200" ] && echo "$body" | grep -q '"result"'; then
-      fail_count=0
-      echo "[Health] OK after retry"
-      continue
-    fi
-
-    final_reason=$(rpc_failure_reason "$exit_code" "$http_code")
-    fail_count=$((fail_count + 1))
-    echo "[Health] FAIL ${fail_count}/${max_fail} (Reason: $final_reason)"
-
-    if [ "$fail_count" -ge "$max_fail" ]; then
-      restart_anvil
-      fail_count=0
-    fi
   done
 }
-health_loop &
 
-# ---------- 6. Render 对外健康端口 ----------
-# 不再永远返回绿灯：Anvil 可响应才返回 200，否则返回 503。
-render_health_server() {
-  while true; do
-    if curl -s --max-time 2 \
-      -X POST \
-      -H "Content-Type: application/json" \
-      --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-      http://127.0.0.1:8545 | grep -q '"result"'; then
-      status="200 OK"
-      body="OK"
-    else
-      status="503 Service Unavailable"
-      body="Anvil unavailable"
-    fi
-
-    printf 'HTTP/1.1 %s\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s\n' \
-      "$status" "$body" | nc -l -p "${PORT:-3000}" -q 1
-  done
+if [ -z "${NGROK_AUTHTOKEN:-}" ]; then echo '[Fatal] NGROK_AUTHTOKEN missing'; exit 1; fi
+ngrok config add-authtoken "$NGROK_AUTHTOKEN" || exit 1
+status_write starting
+anvil_supervisor &
+ANVIL_SUPERVISOR_PID=$!
+monitor_supervisor &
+MONITOR_SUPERVISOR_PID=$!
+ngrok_supervisor &
+NGROK_SUPERVISOR_PID=$!
+shutdown_all() {
+  trap '' TERM INT
+  echo '[Shutdown] Stopping ngrok, monitor and Anvil supervisors'
+  kill -TERM "$NGROK_SUPERVISOR_PID" "$MONITOR_SUPERVISOR_PID" "$ANVIL_SUPERVISOR_PID" 2>/dev/null || true
+  wait "$NGROK_SUPERVISOR_PID" "$MONITOR_SUPERVISOR_PID" "$ANVIL_SUPERVISOR_PID" 2>/dev/null || true
 }
-render_health_server &
-
-# ---------- 7. ngrok 保持原版固定域名逻辑 ----------
-if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
-  echo "[Fatal] NGROK_AUTHTOKEN is not configured"
-  exit 1
-fi
-
-ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-
-# 新实例先读回远程账本并恢复余额，再开放原来的 ngrok→Anvil 直连入口。
-echo "[Ledger] Waiting for remote ledger recovery before opening ngrok..."
-while [ "$(cat /opt/node-monitor/data/ledger-ready 2>/dev/null)" != "${LEDGER_ID:-}" ] || [ -z "${LEDGER_ID:-}" ]; do
-  sleep 2
-done
-
-# Render 暂停/重启时，旧 ngrok 会话可能在服务器端延迟释放。
-# 不启用 pooling（避免两个不同 Anvil 状态被负载均衡）；只等待旧会话释放后重试。
-while true; do
-  if [ -z "${NGROK_DOMAIN:-}" ]; then
-    ngrok http 8545 &
-  else
-    ngrok http --url="https://${NGROK_DOMAIN}" 8545 &
-  fi
-  NGROK_PID=$!
-  wait "$NGROK_PID"
-  ngrok_exit=$?
-  NGROK_PID=""
-  echo "[Ngrok] Exited with code ${ngrok_exit}; endpoint may still be releasing. Retrying in 15s..."
-  sleep 15
-done
+trap 'shutdown_all; exit 0' TERM INT
+# 各组件自身恢复；监督器本身死亡才退出容器，不能留下虚假的健康状态。
+wait -n "$ANVIL_SUPERVISOR_PID" "$MONITOR_SUPERVISOR_PID" "$NGROK_SUPERVISOR_PID"
+echo '[Fatal] A component supervisor exited unexpectedly'
+shutdown_all
+exit 1
 START_SCRIPT_EOF
-
 chmod +x /start.sh
+bash -n /start.sh
 DOCKER_BUILD_EOF
-
 CMD ["/start.sh"]
+
 
 
 
